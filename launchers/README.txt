@@ -58,6 +58,25 @@ KEYS
   B   start / stop sharing
   R   rescan now        L  full-screen log       ?  help       Q  quit
 
+COGS CATALOG LOCAL R/W  (needs card firmware 1.42)
+
+  Keeps a copy of the whole a2cogs.com disk catalog on this computer,
+  about 2 GB, and shares it writable. The card shows it as its own row
+  on Browse Disks, so high scores and saved games stay.
+
+  M   download it (asks first); once it is here, jump to its section
+  S   sync now: new and changed titles. Also at start and once a day.
+  X   reset: a fresh copy of the selected disk image, or of all yours
+  O   sort by name or by status
+  D   delete the copy from this computer (asks twice)
+
+  *  Yours (Local): you wrote to it; a sync leaves it alone
+  !  a newer copy is on a2cogs (X takes it)
+  +  Added (Local): a disk image you put in the folder yourself
+
+  On the card: Image/Audio Source, S to scan, pick this computer, then
+  C for CoGS Catalog Local R/W or T for all four.
+
 WHAT IT SERVES
 
   Disk images   .2mg .po .hdv  (.dsk .do .woz .nib are skipped; the card
@@ -80,6 +99,10 @@ OPTIONS
   --prefix-subfolder    prefix subfolder names inside categories
   --plain               line-mode UI instead of the full screen
   --headless            no UI; log to stdout (NAS, systemd, screen)
+  --local-dir FOLDER    where CoGS Catalog Local R/W is kept (default:
+                        "CoGS Catalog Local" beside the library)
+  --local-download      start the catalog download at launch
+  --no-auto-sync        do not sync the local catalog at start or daily
 
 GETTING THE ZIP ONTO AN OLD MAC
 
