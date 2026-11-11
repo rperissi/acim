@@ -142,6 +142,16 @@ this computer, then C or T.
   catalog comes down, and the host gets one more try at the end. If it
   is still down the log says how many images it kept, and the hourly
   sync fetches them once it is back.
+- Outside images come from a2cogs (0.4). About one image in eight is
+  linked on an outside host (apple2.org.za, GitHub, archive.org). a2cogs
+  keeps a copy of each on
+  `disks.a2cogs.com/mirror/` and names it in the catalog's `mirror` map.
+  Download and sync take the copy, so they do not depend on the outside
+  hosts, and sync notices when one of those images changes. An image
+  with no copy is asked of its own host, under the rule above. An image
+  fetched from its own host by 0.3 is compared with the copy (MD5) and
+  not fetched again when it is the same. The card still streams these
+  titles from the outside host.
 - Stopping a download is not a failure (0.4). Images in flight are
   dropped without a `could not fetch` line, and the last line says how
   many are not fetched yet. `S` fetches the rest. A try that is waiting

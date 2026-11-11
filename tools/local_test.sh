@@ -93,7 +93,8 @@ if stage == 4:
     add("Clash Title", "Clash.po", 280, 19, cat="G", host="gs")
 if stage >= 2:
     add("New Arrival", "New Arrival.po", 280, 17, cat="T", host="gs", boot=False)
-if stage == 5:      # three titles on an outside host, named so they sort into the middle
+mirror = {}
+if stage >= 5:      # three titles on an outside host, named so they sort into the middle
     for i, n in enumerate(("Far One.po", "Far Three.po", "Far Two.po")):
         add(n[:-3], n, 280, 21 + i, cat="G", host="gs", _noimg=True)
         vols[-1]["url"] = "http://127.0.0.1:%s/disks/%s" % (farport, n.replace(" ", "%20"))
@@ -101,8 +102,18 @@ if stage == 5:      # three titles on an outside host, named so they sort into t
         for k in range(0, len(b), 7):
             b[k] = (k * (21 + i) + 1) & 0xFF
         open(os.path.join(far, "disks", n), "wb").write(bytes(b))
+        if stage == 6:  # the site keeps a copy of each (not of Far Three: it has an entry and no copy)
+            mirror[vols[-1]["url"]] = "http://127.0.0.1:%s/mirror/%s" % (port, n.replace(" ", "%20"))
+            if not os.path.isdir(os.path.join(site, "mirror")):
+                os.mkdir(os.path.join(site, "mirror"))
+            if n != "Far Three.po":
+                open(os.path.join(site, "mirror", n), "wb").write(bytes(b))
 vols.sort(key=lambda e: e["name"].lower())
-json.dump({"catalog": "test", "note": "x", "volumes": vols}, open(os.path.join(site, "catalog-all.json"), "w"), indent=1)
+doc = {"catalog": "test", "note": "x"}
+if mirror:
+    doc["mirror"] = mirror
+doc["volumes"] = vols
+json.dump(doc, open(os.path.join(site, "catalog-all.json"), "w"), indent=1)
 EOF
 }
 
@@ -524,6 +535,75 @@ grep -q "^#synced 0" "$LOC/images.tsv" && ok "a stopped download is not a sync" 
 curl -s -o /dev/null "$B/cogs-volumes.json" && ok "the share is still up after Stop" || bad "share gone after stop"
 stop_cim
 far_down
+# --- copies of the outside images on a2cogs ---
+# The catalog's "mirror" map names a copy on the site for each outside
+# image, and the download takes that one. Far Three has an entry and no
+# copy. The outside host is down for the whole stage.
+make_site 6
+row() { grep "^$1	" "$LOC/images.tsv"; }
+retag() {  # retag <file> <tag> [state]: the record as an older fetch left it
+python3 - "$LOC/images.tsv" "$@" <<'EOF'
+import sys, io
+p, f, tag = sys.argv[1], sys.argv[2], sys.argv[3]
+L = io.open(p, encoding="utf-8").read().split("\n")
+for i, l in enumerate(L):
+    c = l.split("\t")
+    if c[0] == f:
+        c[3] = tag
+        if len(sys.argv) > 4:
+            c[4] = sys.argv[4]
+        L[i] = "\t".join(c)
+io.open(p, "w", encoding="utf-8").write("\n".join(L))
+EOF
+}
+newcopy() {  # newcopy <file> <seed>: other bytes for the copy on the site
+python3 - "$SITE/mirror/$1" "$2" <<'EOF'
+import sys
+b = bytearray(512 * 280)
+for k in range(0, len(b), 7):
+    b[k] = (k * int(sys.argv[2]) + 1) & 0xFF
+open(sys.argv[1], "wb").write(bytes(b))
+EOF
+}
+md5tag() { python3 -c 'import sys, hashlib; print("copy:\"%s\"" % hashlib.md5(open(sys.argv[1], "rb").read()).hexdigest())' "$1"; }
+LOC="$DIR/local-copy"
+CIM_LOCAL_HOST_REST=1 start_cim --local-download
+wait_log "titles, 9 images" && ok "with the outside host down, the images a2cogs has a copy of come down (9 images)" || bad "copies: $(cat "$DIR/cim.log")"
+cmp -s "$SITE/mirror/Far One.po" "$LOC/disks/Far One.po" && cmp -s "$SITE/mirror/Far Two.po" "$LOC/disks/Far Two.po" && ok "they are the copy's bytes" || bad "copy bytes"
+row "Far One.po" | grep -q "	http://127.0.0.1:$FAR/disks/Far%20One.po	" && ok "the record keeps the catalog URL" || bad "record url: $(row 'Far One.po')"
+[ "$(row 'Far One.po' | cut -f4)" = "$(md5tag "$SITE/mirror/Far One.po")" ] && ok "the recorded tag is the copy's, marked copy:" || bad "record tag: $(row 'Far One.po')"
+grep -q "no copy of Far Three.po on a2cogs: asking 127.0.0.1:$FAR" "$DIR/cim.log" && ok "an image with no copy is asked of its own host" || bad "no copy line: $(cat "$DIR/cim.log")"
+grep -q "download: 9 image(s) fetched.*, 1 left for the next Sync (127.0.0.1:$FAR not answering)" "$DIR/cim.log" && ok "and is left for the next Sync while that host is down" || bad "copy summary: $(grep fetched "$DIR/cim.log")"
+stop_cim
+far_up
+start_cim --local-download
+wait_log "sync: 1 image(s) fetched" && cmp -s "$FARSITE/disks/Far Three.po" "$LOC/disks/Far Three.po" && ok "the next sync fetches it from its own host" || bad "no-copy fetch: $(cat "$DIR/cim.log")"
+row "Far Three.po" | cut -f4 | grep -q "^copy:" && bad "a tag from the outside host is marked copy:" || ok "its tag is the outside host's, not marked"
+stop_cim
+far_down
+# images fetched from the outside host before a2cogs kept a copy (or by
+# 1.9 / 0.3): the same bytes take the copy's tag and are not fetched again
+retag "Far One.po" '"tag-of-the-outside-host"'
+retag "Far Two.po" 'Tue, 01 Jan 2030 00:00:00 GMT' yours
+start_cim --local-download
+wait_log "sync: 0 image(s) fetched" && ! grep -q "newer cop\|updated" "$DIR/cim.log" && ok "images that came from the outside host are not fetched again" || bad "takeover: $(cat "$DIR/cim.log")"
+[ "$(row 'Far One.po' | cut -f4)" = "$(md5tag "$SITE/mirror/Far One.po")" ] && [ "$(row 'Far Two.po' | cut -f4)" = "$(md5tag "$SITE/mirror/Far Two.po")" ] && ok "their tags are the copy's from then on" || bad "takeover tags: $(row 'Far One.po') / $(row 'Far Two.po')"
+row "Far Two.po" | grep -q "	yours	.*	0$" && ok "a yours image is not flagged newer by the takeover" || bad "takeover yours: $(row 'Far Two.po')"
+stop_cim
+# an untouched image whose bytes are not the copy's is replaced
+retag "Far One.po" '"tag-of-the-outside-host"'
+newcopy "Far One.po" 77
+start_cim --local-download
+wait_log "sync: 1 image(s) fetched" && grep -q "1 updated" "$DIR/cim.log" && cmp -s "$SITE/mirror/Far One.po" "$LOC/disks/Far One.po" && ok "an untouched image that differs from the copy is replaced" || bad "takeover differs: $(cat "$DIR/cim.log")"
+stop_cim
+# the copy changes later: an untouched image follows, a yours one is flagged
+newcopy "Far One.po" 78
+newcopy "Far Two.po" 79
+start_cim --local-download
+wait_log "1 updated, 1 newer copy of images marked yours" && cmp -s "$SITE/mirror/Far One.po" "$LOC/disks/Far One.po" && ok "a changed copy replaces an untouched image and flags a yours one" || bad "copy changed: $(cat "$DIR/cim.log")"
+row "Far Two.po" | grep -q "	yours	.*	1$" && ok "the yours image keeps its bytes and is flagged newer" || bad "copy changed yours: $(row 'Far Two.po')"
+grep -q "is not answering\|could not fetch" "$DIR/cim.log" && bad "the outside host was needed: $(cat "$DIR/cim.log")" || ok "none of it needed the outside host"
+stop_cim
 LOC="$MAIN_LOC"
 make_site 2
 

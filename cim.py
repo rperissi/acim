@@ -1034,6 +1034,13 @@ def files_put(root, raw_name, body, content_range):
 # Every image is writable. The first write marks it "yours" and sync
 # leaves it alone from then on; when the catalog has a newer copy of a
 # yours image it is flagged, and Reset fetches it.
+#
+# About one image in eight is on an outside host (apple2.org.za, GitHub,
+# archive.org). The catalog's "mirror" map names a copy of each of those
+# on disks.a2cogs.com, and that copy is what is downloaded and checked,
+# so a download does not depend on the outside hosts. The record keeps
+# the catalog URL; a tag that came from the copy is written
+# "copy:<ETag>". The card still streams from the outside host.
 
 LOCAL_NAME = u"CoGS Catalog Local R/W"
 LOCAL_DIR_NAME = u"CoGS Catalog Local"
@@ -1047,6 +1054,7 @@ LOCAL_SYNC_AT_OPEN = 3600      # at start: a sync when the last one is over an h
 LOCAL_LOCK_STALE = 15 * 60     # a .working nobody touched for this long is dead
 LOCAL_PRUNE_MIN = 8            # a sync removes this many dropped images without a second look
 LOCAL_HEAD_HOSTS = (u"disks.a2cogs.com", u"a2cogs.com")   # hosts asked for a revision tag
+LOCAL_COPY_MARK = u"copy:"     # a recorded tag that came from the copy on a2cogs
 
 
 def _env_seconds(name, std):                   # tools/local_test.sh shortens these
@@ -1071,6 +1079,10 @@ LOCAL_HOST_REST = _env_seconds("CIM_LOCAL_HOST_REST", 15)
 
 class LocalStopped(Exception):
     """Stop was pressed. Nothing failed: the image is fetched next time."""
+
+
+class LocalNoCopy(Exception):
+    """a2cogs answered, and not with the copy: the image's own host is asked."""
 
 
 class LocalHostAside(Exception):
@@ -1269,6 +1281,7 @@ class LocalCatalog(object):
         self.added = {}           # file -> LocalTitle: images the user put in disks/
         self._added_seen = {}     # file -> ((mtime, size), LocalTitle), so a scan reads each once
         self.enabled = False      # a catalog.json is in the folder
+        self.mirror = {}          # outside URL -> its copy on a2cogs (the catalog's "mirror")
         self.synced = 0           # unix time of the last finished sync
         self.job = None           # dict while a download / sync / reset runs
         self.cancel = False
@@ -1470,9 +1483,11 @@ class LocalCatalog(object):
                 raw = f.read()
             finally:
                 f.close()
-            titles = self.parse_catalog(raw)
+            mirror = {}
+            titles = self.parse_catalog(raw, mirror)
         except (IOError, OSError, ValueError, KeyError, TypeError):
             titles = []
+            mirror = {}
         if titles:
             try:
                 f = open(self.kept_path(), "rb")
@@ -1523,6 +1538,7 @@ class LocalCatalog(object):
         self.lock.acquire()
         try:
             self.titles = titles
+            self.mirror = mirror
             self.images = images
             self.synced = synced
             self.enabled = bool(titles)
@@ -1558,8 +1574,13 @@ class LocalCatalog(object):
         if changed:
             self.save_record()
 
-    def parse_catalog(self, raw):
+    def parse_catalog(self, raw, mirror=None):
+        """The titles. mirror: a dict that takes the catalog's "mirror"
+        map, outside URL -> the copy of that image on a2cogs."""
         doc = json_loads(raw)
+        m = doc.get(u"mirror")
+        if mirror is not None and isinstance(m, dict):
+            mirror.update(dict([(k, v) for k, v in m.items() if isinstance(v, type(u""))]))
         return [LocalTitle(v) for v in doc[u"volumes"] if v.get(u"url") and v.get(u"name")]
 
     def save_record(self):
@@ -1925,9 +1946,11 @@ class LocalCatalog(object):
             raw = r.read()
         finally:
             r.close()
-        titles = self.parse_catalog(raw)
+        mirror = {}
+        titles = self.parse_catalog(raw, mirror)
         if not titles:
             raise IOError("the catalog came back empty")
+        self.mirror = mirror
         makedirs(self.dir)
         makedirs(self.disks_dir)
         tmp = self.catalog_path() + u".tmp"
@@ -1996,10 +2019,33 @@ class LocalCatalog(object):
         except Exception:
             return u""
 
-    def fetch_image(self, url, fname, again=False):
+    def same_bytes(self, fname, etag):
+        """True when the file's bytes are the ones the copy's ETag names
+        (R2's ETag is the MD5), or when the ETag is not an MD5 and cannot say."""
+        want = etag.strip(u'"').lower()
+        if len(want) != 32 or [c for c in want if c not in u"0123456789abcdef"]:
+            return True
+        try:
+            f = open(self.image_path(fname), "rb")
+        except (IOError, OSError):
+            return False
+        try:
+            h = hashlib.md5()
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        finally:
+            f.close()
+        return h.hexdigest() == want
+
+    def fetch_image(self, url, fname, again=False, copy=False):
         """Download url into disks/fname. Returns (tag, bytes). Raises
         LocalStopped when Stop was pressed and LocalHostAside when the host
-        is set aside (again: asks a host that is set aside anyway, once)."""
+        is set aside (again: asks a host that is set aside anyway, once).
+        copy: url is the copy on a2cogs, and any reply but the image
+        raises LocalNoCopy."""
         dest = self.image_path(fname)
         part = dest + u".part"
         host = url_host_of(url)
@@ -2018,6 +2064,8 @@ class LocalCatalog(object):
                         raise LocalStopped()
                     if hasattr(e, "code"):
                         self.host_answered(host)      # an HTTP status: the host is up
+                        if copy:
+                            raise LocalNoCopy()
                     else:
                         self.host_missed(host)
                         if self.is_aside(host):
@@ -2058,7 +2106,7 @@ class LocalCatalog(object):
                     pass
                 if self.cancel:
                     raise LocalStopped()
-                if isinstance(last, (LocalStopped, LocalHostAside)):
+                if isinstance(last, (LocalStopped, LocalHostAside, LocalNoCopy)):
                     raise last
                 if again:
                     break
@@ -2173,17 +2221,21 @@ class LocalCatalog(object):
                     self.lock.release()
                 self.log(u"%s was already in the folder: kept as Yours (Local), "
                          u"Reset takes the a2cogs copy" % fname)
+            # src: where it is fetched from, the copy on a2cogs when the
+            # catalog names one, else url
+            src = self.mirror.get(url, url)
             if im is None or not on_disk or fname in reset:
-                todo.append((fname, url, u"fetch"))
+                todo.append((fname, url, src, u"fetch"))
                 need += size_of.get(fname, 0)
             else:
-                todo.append((fname, url, u"check"))
+                todo.append((fname, url, src, u"check"))
         free = self.free_bytes()
         if free is not None and need and free < need + 64 * 1048576:
             raise IOError("not enough room: %s needed, %s free on %s" % (
                 fmt_mb(need), fmt_mb(free), self.dir))
-        # a2cogs's own hosts first, then the outside hosts one after another,
-        # so an outside host that is down costs the tail of the job, not the middle
+        # a2cogs's own hosts first (the copies of outside images are there
+        # too), then the outside hosts one after another, so an outside host
+        # that is down costs the tail of the job, not the middle
         home = url_host_of(self.catalog_url)
 
         def outside(url):
@@ -2191,9 +2243,9 @@ class LocalCatalog(object):
             if h == home or h in LOCAL_HEAD_HOSTS:
                 return u""
             return h
-        todo = [x[1] for x in sorted([((outside(t[1]), i), t) for i, t in enumerate(todo)])]
+        todo = [x[1] for x in sorted([((outside(t[2]), i), t) for i, t in enumerate(todo)])]
         j = self.job
-        j[u"total"] = len([t for t in todo if t[2] == u"fetch"])
+        j[u"total"] = len([t for t in todo if t[3] == u"fetch"])
         j[u"bytes_total"] = need
         self.host_misses = {}
         self.host_aside = {}
@@ -2204,13 +2256,24 @@ class LocalCatalog(object):
 
         def one(item, final, again=False):
             """One image. final: a host set aside now is not looked at again."""
-            fname, url, act = item
+            fname, url, src, act = item
             im = self.images.get(fname)
             if act == u"check":
                 changed = (im.url != url)
                 if not changed:
-                    new_tag = self.remote_tag(url)
-                    changed = bool(new_tag and im.tag and new_tag != im.tag)
+                    new_tag = self.remote_tag(src)
+                    if src == url:
+                        changed = bool(new_tag and im.tag and new_tag != im.tag)
+                    elif new_tag and im.tag != LOCAL_COPY_MARK + new_tag:
+                        # A tag without the mark is the outside host's: the
+                        # image came down before a2cogs kept a copy. The same
+                        # bytes, or a yours image (nothing to compare), take
+                        # the copy's tag and stay as they are.
+                        if im.tag.startswith(LOCAL_COPY_MARK) or not (
+                                im.state == u"yours" or self.same_bytes(fname, new_tag)):
+                            changed = True
+                        else:
+                            im.tag = LOCAL_COPY_MARK + new_tag
                 if not changed:
                     if im.newer and im.state != u"yours":
                         im.newer = False
@@ -2224,18 +2287,26 @@ class LocalCatalog(object):
                 act = u"update"           # the fetch replaces a copy the catalog has a newer one of
                 j[u"total"] += 1
             try:
-                tag, n = self.fetch_image(url, fname, again)
+                if src != url:
+                    try:
+                        tag, n = self.fetch_image(src, fname, again, True)
+                        tag = LOCAL_COPY_MARK + tag
+                    except LocalNoCopy:
+                        self.log(u"no copy of %s on a2cogs: asking %s" % (fname, url_host_of(url)))
+                        src = url
+                if src == url:
+                    tag, n = self.fetch_image(url, fname, again)
             except LocalStopped:
                 return                    # not a failure: the next download or sync fetches it
             except LocalHostAside:
                 qlock.acquire()
                 try:
                     if final:
-                        host = url_host_of(url)
+                        host = url_host_of(src)
                         stats[u"left"] += 1
                         down[host] = down.get(host, 0) + 1
                     else:
-                        later.append((fname, url, act))
+                        later.append((fname, url, src, act))
                 finally:
                     qlock.release()
                 return
@@ -2293,12 +2364,12 @@ class LocalCatalog(object):
         # the hosts set aside get one more try, now that the rest is here
         hosts = []
         for item in later:
-            if url_host_of(item[1]) not in hosts:
-                hosts.append(url_host_of(item[1]))
+            if url_host_of(item[2]) not in hosts:
+                hosts.append(url_host_of(item[2]))
         for host in hosts:
             if self.cancel:
                 break
-            items = [item for item in later if url_host_of(item[1]) == host]
+            items = [item for item in later if url_host_of(item[2]) == host]
             since = self.host_aside.get(host)
             if since is not None:
                 j[u"note"] = u"trying %s again" % host
