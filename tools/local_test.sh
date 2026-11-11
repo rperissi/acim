@@ -17,17 +17,18 @@ cd "$(dirname "$0")/.."
 
 PORT=8296
 UP=8295
+FAR=8291        # a second, outside host: down, up, or hanging
 PY="${PY:-python3}"
 DIR=$(mktemp -d /tmp/cogs-local-test.XXXX)
-LIBD="$DIR/library"; LOC="$DIR/local"; SITE="$DIR/site"
-mkdir -p "$LIBD" "$SITE/disks"
+LIBD="$DIR/library"; LOC="$DIR/local"; SITE="$DIR/site"; FARSITE="$DIR/far"
+mkdir -p "$LIBD" "$SITE/disks" "$FARSITE/disks"
 PASS=0; FAIL=0
-SRV=""; UPS=""
+SRV=""; UPS=""; FARS=""
 
 say()  { printf '%s\n' "$*"; }
 ok()   { PASS=$((PASS+1)); say "PASS  $1"; }
 bad()  { FAIL=$((FAIL+1)); say "FAIL  $1"; }
-cleanup() { [ -n "$SRV" ] && kill $SRV 2>/dev/null; [ -n "$UPS" ] && kill $UPS 2>/dev/null; rm -rf "$DIR"; }
+cleanup() { [ -n "$SRV" ] && kill $SRV 2>/dev/null; [ -n "$UPS" ] && kill $UPS 2>/dev/null; [ -n "$FARS" ] && kill $FARS 2>/dev/null; rm -rf "$DIR"; }
 trap cleanup EXIT
 
 # --- the stand-in site: catalog + images, ETag = md5 of the bytes ---
@@ -57,9 +58,10 @@ HTTPServer(("127.0.0.1", int(sys.argv[2])), H).serve_forever()
 EOF
 
 make_site() {  # make_site <stage>: 1 = first catalog, 2 = the catalog after an update
-python3 - "$SITE" "$UP" "$1" <<'EOF'
+python3 - "$SITE" "$UP" "$1" "$FARSITE" "$FAR" <<'EOF'
 import sys, os, json
 site, port, stage = sys.argv[1], sys.argv[2], int(sys.argv[3])
+far, farport = sys.argv[4], sys.argv[5]
 U = "http://127.0.0.1:%s/disks/" % port
 def img(name, blocks, seed):
     b = bytearray(512 * blocks)
@@ -91,6 +93,14 @@ if stage == 4:
     add("Clash Title", "Clash.po", 280, 19, cat="G", host="gs")
 if stage >= 2:
     add("New Arrival", "New Arrival.po", 280, 17, cat="T", host="gs", boot=False)
+if stage == 5:      # three titles on an outside host, named so they sort into the middle
+    for i, n in enumerate(("Far One.po", "Far Three.po", "Far Two.po")):
+        add(n[:-3], n, 280, 21 + i, cat="G", host="gs", _noimg=True)
+        vols[-1]["url"] = "http://127.0.0.1:%s/disks/%s" % (farport, n.replace(" ", "%20"))
+        b = bytearray(512 * 280)
+        for k in range(0, len(b), 7):
+            b[k] = (k * (21 + i) + 1) & 0xFF
+        open(os.path.join(far, "disks", n), "wb").write(bytes(b))
 vols.sort(key=lambda e: e["name"].lower())
 json.dump({"catalog": "test", "note": "x", "volumes": vols}, open(os.path.join(site, "catalog-all.json"), "w"), indent=1)
 EOF
@@ -443,6 +453,79 @@ grep -q "\* Two D2.po .*yours" "$DIR/other.log" && ok "yours marked by another m
 (sleep 1; touch -t 203001010000 "$LOC/disks/Two D1.po"; echo "m list yours"; echo q) | \
     $PY cim.py "$LIBD" --port $PORT --no-bonjour --plain --local-dir "$LOC" >"$DIR/behind.log" 2>&1
 grep -q "\* Two D1.po .*yours" "$DIR/behind.log" && ok "an image changed while running is marked yours" || bad "changed while running: $(cat "$DIR/behind.log")"
+
+# --- an outside host that does not answer (0.4) ---
+# the 2026-11-10 apple2.org.za outage: all four workers sat on the dead
+# host and the download looked hung
+MAIN_LOC="$LOC"
+far_up()   { python3 "$DIR/upstream.py" "$FARSITE" $FAR & FARS=$!; sleep 0.5; }
+far_down() { [ -n "$FARS" ] && kill $FARS 2>/dev/null; wait $FARS 2>/dev/null; FARS=""; }
+cat > "$DIR/hang.py" <<'EOF'
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(16)
+held = []
+while True:
+    held.append(s.accept()[0])      # takes the connection, never says a word
+EOF
+make_site 5      # the full catalog plus three titles on the outside host
+
+# refused: nothing listens on the outside host's port
+LOC="$DIR/local-far"
+CIM_LOCAL_HOST_REST=1 start_cim --local-download
+wait_log "titles, 7 images" && ok "a download with an outside host down finishes the rest (7 images)" || bad "far down: $(cat "$DIR/cim.log")"
+grep -q "127.0.0.1:$FAR is not answering. Its images wait until the rest are done" "$DIR/cim.log" && ok "the log says the host was set aside" || bad "aside line: $(cat "$DIR/cim.log")"
+grep -q "127.0.0.1:$FAR is still not answering: 3 images left for the next Sync" "$DIR/cim.log" && ok "the log says how many images that host kept" || bad "still line: $(cat "$DIR/cim.log")"
+grep -q "download: 7 image(s) fetched.*, 3 left for the next Sync (127.0.0.1:$FAR not answering)" "$DIR/cim.log" && ok "the last line counts them as left, not failed" || bad "summary: $(grep fetched "$DIR/cim.log")"
+grep -q "could not fetch\|failed" "$DIR/cim.log" && bad "an image on a host set aside was reported failed: $(grep -i 'could not\|failed' "$DIR/cim.log")" || ok "nothing is reported as failed"
+ls "$LOC/disks" | grep -q '^Far\|\.part$' && bad "files from the dead host: $(ls "$LOC/disks")" || ok "no file and no .part from the dead host"
+grep -q "^#synced [1-9]" "$LOC/images.tsv" && ok "the job counts as a sync, so the hourly retry applies" || bad "synced: $(head -2 "$LOC/images.tsv")"
+stop_cim
+far_up
+start_cim --local-download
+wait_log "sync: 3 image(s) fetched" && cmp -s "$FARSITE/disks/Far Two.po" "$LOC/disks/Far Two.po" && ok "the next sync fetches them once the host is back" || bad "far back: $(cat "$DIR/cim.log")"
+stop_cim
+far_down
+
+# the host comes back while the rest downloads: finished in the same job
+LOC="$DIR/local-back"
+CIM_LOCAL_HOST_REST=4 start_cim --local-download
+wait_log "is not answering" || bad "far never set aside: $(cat "$DIR/cim.log")"
+far_up
+wait_log "titles, 10 images" && grep -q "127.0.0.1:$FAR is answering again" "$DIR/cim.log" && ! grep -q "left for\|could not fetch" "$DIR/cim.log" \
+    && ok "a host that comes back before the second look is finished in the same job" || bad "far came back: $(cat "$DIR/cim.log")"
+cmp -s "$FARSITE/disks/Far One.po" "$LOC/disks/Far One.po" && cmp -s "$FARSITE/disks/Far Three.po" "$LOC/disks/Far Three.po" && ok "its images are the outside host's bytes" || bad "far bytes"
+stop_cim
+far_down
+
+# hanging: the host takes the connection and never replies
+python3 "$DIR/hang.py" $FAR & FARS=$!
+sleep 0.5
+LOC="$DIR/local-hang"
+T0=$(date +%s)
+CIM_LOCAL_TIMEOUT=2 CIM_LOCAL_HOST_REST=1 start_cim --local-download
+wait_log "titles, 7 images" && grep -q "3 left for the next Sync" "$DIR/cim.log" && ! grep -q "could not fetch" "$DIR/cim.log" \
+    && ok "a host that hangs is set aside after one timeout" || bad "hang: $(cat "$DIR/cim.log")"
+T1=$(date +%s)
+[ $((T1 - T0)) -le 12 ] && ok "and the whole job took $((T1 - T0)) s (two timeouts of 2 s, not one per image and try)" || bad "hang took $((T1 - T0)) s"
+stop_cim
+
+# Stop while images are in flight: stopped, not failed. A try that is
+# waiting on a host ends when its timeout does (4 s here).
+LOC="$DIR/local-stop"
+CIM_LOCAL_TIMEOUT=4 start_cim --local-download
+for i in $(seq 1 80); do [ "$(ls "$LOC/disks" 2>/dev/null | grep -vc '\.part$')" = 7 ] && break; sleep 0.25; done
+kill -USR1 $SRV
+wait_log "download stopped: 7 image(s) fetched" && ok "Stop ends the job while three images are in flight" || bad "stop: $(cat "$DIR/cim.log")"
+grep -q "could not fetch\|failed" "$DIR/cim.log" && bad "Stop was reported as failed images: $(grep -i 'could not\|failed' "$DIR/cim.log")" || ok "Stop is not reported as failed images"
+grep -q "3 not fetched yet (Sync fetches the rest)" "$DIR/cim.log" && ok "the last line says how many are not fetched yet" || bad "stop summary: $(grep stopped "$DIR/cim.log")"
+grep -q "^#synced 0" "$LOC/images.tsv" && ok "a stopped download is not a sync" || bad "synced after stop: $(head -2 "$LOC/images.tsv")"
+[ ! -f "$LOC/.working" ] && ! ls "$LOC/disks" | grep -q '\.part$' && ok "no lock and no .part left after Stop" || bad "left after stop: $(ls -a "$LOC" "$LOC/disks")"
+curl -s -o /dev/null "$B/cogs-volumes.json" && ok "the share is still up after Stop" || bad "share gone after stop"
+stop_cim
+far_down
+LOC="$MAIN_LOC"
+make_site 2
 
 # --- remove (line mode): asks twice, then the copy is gone ---
 echo keep > "$LOC/disks/not ours.txt"

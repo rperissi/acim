@@ -57,7 +57,7 @@ try:
 except ImportError:
     curses = None
 
-VERSION = "0.3"
+VERSION = "0.4"
 DEFAULT_PORT = 8271
 BLOCK = 512
 PER_PAGE = 16            # disks: what Image Manager serves; the card holds 18
@@ -1047,6 +1047,34 @@ LOCAL_SYNC_AT_OPEN = 3600      # at start: a sync when the last one is over an h
 LOCAL_LOCK_STALE = 15 * 60     # a .working nobody touched for this long is dead
 LOCAL_PRUNE_MIN = 8            # a sync removes this many dropped images without a second look
 LOCAL_HEAD_HOSTS = (u"disks.a2cogs.com", u"a2cogs.com")   # hosts asked for a revision tag
+
+
+def _env_seconds(name, std):                   # tools/local_test.sh shortens these
+    try:
+        return float(os.environ.get(name) or std)
+    except ValueError:
+        return std
+
+
+# One host that stops answering must not hold the whole download (the
+# apple2.org.za outage of 2026-11-10 parked all four workers on it for
+# minutes per image). A try gives up after LOCAL_TIMEOUT with no bytes;
+# LOCAL_HOST_STRIKES tries in a row with no reply at all set the host
+# aside, the rest of the catalog is fetched, and the host gets one more
+# try at the end, no sooner than LOCAL_HOST_REST after it was set aside.
+# What it still does not serve is left for the next sync. Same numbers as
+# the Mac app (LocalCatalog.swift).
+LOCAL_HOST_STRIKES = 2
+LOCAL_TIMEOUT = _env_seconds("CIM_LOCAL_TIMEOUT", 30)
+LOCAL_HOST_REST = _env_seconds("CIM_LOCAL_HOST_REST", 15)
+
+
+class LocalStopped(Exception):
+    """Stop was pressed. Nothing failed: the image is fetched next time."""
+
+
+class LocalHostAside(Exception):
+    """The image's host is set aside for now."""
 LOCAL_CATS = ((u"F", u"Featured"), (u"G", u"Play a game"), (u"C", u"Music & art"),
               (u"E", u"Educate & learn"), (u"T", u"Go online"),
               (u"S", u"Utilities & work"), (u"D", u"Demos & odds"))
@@ -1247,6 +1275,9 @@ class LocalCatalog(object):
         self._listed = None
         self.stamp = None         # the record and the catalog as we last read or wrote them
         self.auto_tried = 0       # unix time of the last automatic sync
+        self.short = False        # the last job left images unfetched: try again in an hour
+        self.host_misses = {}     # host -> tries in a row with no reply
+        self.host_aside = {}      # host -> when it was set aside, in this job
         self.load()
 
     # -- paths
@@ -1728,7 +1759,7 @@ class LocalCatalog(object):
                 return None
             # held as a job so a download cannot start under the delete
             self.job = {u"what": u"remove", u"total": 0, u"done": 0, u"failed": 0,
-                        u"bytes": 0, u"bytes_total": 0}
+                        u"bytes": 0, u"bytes_total": 0, u"note": u""}
             names = set(self.images.keys())
             for t in self.titles:
                 names.add(t.file)
@@ -1829,6 +1860,8 @@ class LocalCatalog(object):
             s += u", %s" % fmt_mb(j[u"bytes"])
         if j[u"failed"]:
             s += u", %d failed" % j[u"failed"]
+        if j[u"note"]:
+            s += u", %s" % j[u"note"]     # "trying <host> again" while the job waits on one
         return s
 
     def start(self, what, reset=None):
@@ -1845,7 +1878,7 @@ class LocalCatalog(object):
                 return False
             self.cancel = False
             self.job = {u"what": what, u"total": 0, u"done": 0, u"failed": 0,
-                        u"bytes": 0, u"bytes_total": 0}
+                        u"bytes": 0, u"bytes_total": 0, u"note": u""}
         finally:
             self.lock.release()
         daemon_thread(self.run_job, (what, reset)).start()
@@ -1854,16 +1887,18 @@ class LocalCatalog(object):
     def auto_sync(self, at_open=False, now=None):
         """Sync without being asked, once a copy is here: at start when the
         last sync is over an hour old, and once a day while running. A
-        failed try (offline) waits an hour. Returns True when one started."""
+        failed try (offline) waits an hour, and so does a sync that left
+        images unfetched. Returns True when one started."""
         self.reload_if_changed()
         if not self.enabled or self.job is not None or not self.synced:
             return False
         now = now or int(time.time())
         age = now - self.synced
+        every = self.short and 3600 or LOCAL_SYNC_EVERY
         if at_open:
             if age < LOCAL_SYNC_AT_OPEN:
                 return False
-        elif age < LOCAL_SYNC_EVERY or now - self.auto_tried < 3600:
+        elif age < every or now - self.auto_tried < 3600:
             return False
         self.auto_tried = now
         self.log(u"%s: %s" % (LOCAL_NAME, at_open and u"checking a2cogs for new titles"
@@ -1904,13 +1939,55 @@ class LocalCatalog(object):
         rename_over(tmp, self.catalog_path())
         return titles
 
+    def is_aside(self, host):
+        return host in self.host_aside
+
+    def host_missed(self, host):
+        """A try at host ended with no reply (no address, no connection, a
+        timeout before the headers). The second in a row sets it aside."""
+        self.lock.acquire()
+        try:
+            if host in self.host_aside:
+                return
+            n = self.host_misses.get(host, 0) + 1
+            self.host_misses[host] = n
+            if n < LOCAL_HOST_STRIKES:
+                return
+            self.host_aside[host] = time.time()
+        finally:
+            self.lock.release()
+        self.log(u"%s is not answering. Its images wait until the rest are done" % host)
+
+    def host_answered(self, host):
+        """host sent a reply (any status): it is up."""
+        self.lock.acquire()
+        try:
+            self.host_misses[host] = 0
+            was = self.host_aside.pop(host, None) is not None
+        finally:
+            self.lock.release()
+        if was:
+            self.log(u"%s is answering again" % host)
+
     def remote_tag(self, url):
         """The host's revision tag for url (ETag, else Last-Modified), or
-        u'' when it cannot be had. Only our own hosts are asked."""
-        if url_host_of(url) not in LOCAL_HEAD_HOSTS and not url.startswith(u"http://127.0.0.1"):
+        u'' when it cannot be had. Only our own hosts are asked, and not
+        one that is set aside."""
+        host = url_host_of(url)
+        if host not in LOCAL_HEAD_HOSTS and not url.startswith(u"http://127.0.0.1"):
+            return u""
+        if self.is_aside(host):
             return u""
         try:
-            r = http_open(url, head=True, timeout=30)
+            r = http_open(url, head=True, timeout=LOCAL_TIMEOUT)
+        except Exception:
+            if hasattr(sys.exc_info()[1], "code"):
+                self.host_answered(host)      # an HTTP status: the host is up
+            elif not self.cancel:
+                self.host_missed(host)
+            return u""
+        self.host_answered(host)
+        try:
             try:
                 info = r.info()
                 return tos(info.get("ETag") or info.get("Last-Modified") or u"").strip()
@@ -1919,16 +1996,34 @@ class LocalCatalog(object):
         except Exception:
             return u""
 
-    def fetch_image(self, url, fname):
-        """Download url into disks/fname. Returns (tag, bytes)."""
+    def fetch_image(self, url, fname, again=False):
+        """Download url into disks/fname. Returns (tag, bytes). Raises
+        LocalStopped when Stop was pressed and LocalHostAside when the host
+        is set aside (again: asks a host that is set aside anyway, once)."""
         dest = self.image_path(fname)
         part = dest + u".part"
+        host = url_host_of(url)
         last = None
-        for attempt in range(3):
+        for attempt in range(again and 1 or 3):
             if self.cancel:
-                raise IOError("stopped")
+                raise LocalStopped()
+            if not again and self.is_aside(host):
+                raise LocalHostAside()
             try:
-                r = http_open(url, timeout=120)
+                try:
+                    r = http_open(url, timeout=LOCAL_TIMEOUT)
+                except Exception:
+                    e = sys.exc_info()[1]
+                    if self.cancel:
+                        raise LocalStopped()
+                    if hasattr(e, "code"):
+                        self.host_answered(host)      # an HTTP status: the host is up
+                    else:
+                        self.host_missed(host)
+                        if self.is_aside(host):
+                            raise LocalHostAside()
+                    raise e
+                self.host_answered(host)
                 try:
                     info = r.info()
                     tag = tos(info.get("ETag") or info.get("Last-Modified") or u"").strip()
@@ -1946,7 +2041,7 @@ class LocalCatalog(object):
                             if j:
                                 j[u"bytes"] += len(chunk)
                             if self.cancel:
-                                raise IOError("stopped")
+                                raise LocalStopped()
                     finally:
                         f.close()
                 finally:
@@ -1962,8 +2057,16 @@ class LocalCatalog(object):
                 except OSError:
                     pass
                 if self.cancel:
+                    raise LocalStopped()
+                if isinstance(last, (LocalStopped, LocalHostAside)):
+                    raise last
+                if again:
                     break
-                time.sleep(1 + 2 * attempt)
+                wait = time.time() + 1 + 2 * attempt
+                while time.time() < wait and not self.cancel:
+                    time.sleep(0.25)
+        if self.cancel:
+            raise LocalStopped()
         raise IOError(tos(str(last)))
 
     def free_bytes(self):
@@ -2079,79 +2182,151 @@ class LocalCatalog(object):
         if free is not None and need and free < need + 64 * 1048576:
             raise IOError("not enough room: %s needed, %s free on %s" % (
                 fmt_mb(need), fmt_mb(free), self.dir))
+        # a2cogs's own hosts first, then the outside hosts one after another,
+        # so an outside host that is down costs the tail of the job, not the middle
+        home = url_host_of(self.catalog_url)
+
+        def outside(url):
+            h = url_host_of(url)
+            if h == home or h in LOCAL_HEAD_HOSTS:
+                return u""
+            return h
+        todo = [x[1] for x in sorted([((outside(t[1]), i), t) for i, t in enumerate(todo)])]
         j = self.job
         j[u"total"] = len([t for t in todo if t[2] == u"fetch"])
         j[u"bytes_total"] = need
-        stats = {u"fetched": 0, u"bytes": 0, u"newer": 0, u"replaced": 0, u"failed": 0}
-        queue = list(todo)
+        self.host_misses = {}
+        self.host_aside = {}
+        stats = {u"fetched": 0, u"bytes": 0, u"newer": 0, u"replaced": 0, u"failed": 0, u"left": 0}
+        later = []                # their host was set aside: looked at again at the end
+        down = {}                 # hosts that never came back -> how many images each kept
         qlock = threading.Lock()
 
-        def worker():
-            while not self.cancel:
+        def one(item, final, again=False):
+            """One image. final: a host set aside now is not looked at again."""
+            fname, url, act = item
+            im = self.images.get(fname)
+            if act == u"check":
+                changed = (im.url != url)
+                if not changed:
+                    new_tag = self.remote_tag(url)
+                    changed = bool(new_tag and im.tag and new_tag != im.tag)
+                if not changed:
+                    if im.newer and im.state != u"yours":
+                        im.newer = False
+                    return
+                if im.state == u"yours":
+                    if not im.newer:
+                        im.newer = True
+                        stats[u"newer"] += 1
+                        self.log(u"newer copy on a2cogs: %s (yours kept; Reset takes it)" % fname)
+                    return
+                act = u"update"           # the fetch replaces a copy the catalog has a newer one of
+                j[u"total"] += 1
+            try:
+                tag, n = self.fetch_image(url, fname, again)
+            except LocalStopped:
+                return                    # not a failure: the next download or sync fetches it
+            except LocalHostAside:
                 qlock.acquire()
                 try:
-                    if not queue:
-                        return
-                    fname, url, act = queue.pop(0)
+                    if final:
+                        host = url_host_of(url)
+                        stats[u"left"] += 1
+                        down[host] = down.get(host, 0) + 1
+                    else:
+                        later.append((fname, url, act))
                 finally:
                     qlock.release()
-                self.touch_folder()
-                im = self.images.get(fname)
-                new_tag = None
-                if act == u"check":
-                    changed = (im.url != url)
-                    if not changed:
-                        new_tag = self.remote_tag(url)
-                        changed = bool(new_tag and im.tag and new_tag != im.tag)
-                    if not changed:
-                        if im.newer and im.state != u"yours":
-                            im.newer = False
-                        continue
-                    if im.state == u"yours":
-                        if not im.newer:
-                            im.newer = True
-                            stats[u"newer"] += 1
-                            self.log(u"newer copy on a2cogs: %s (yours kept; Reset takes it)" % fname)
-                        continue
+                return
+            except Exception:
+                e = sys.exc_info()[1]
+                stats[u"failed"] += 1
+                j[u"failed"] += 1
+                self.log(u"could not fetch %s: %s" % (fname, tos(str(e))))
+                return
+            self.lock.acquire()
+            try:
+                im = LocalImage(fname, url)
+                im.bytes = n
+                im.tag = tag
+                try:
+                    im.mtime = int(os.stat(self.image_path(fname)).st_mtime)
+                except OSError:
+                    im.mtime = 0
+                self.images[fname] = im
+                self.have.add(fname)
+                self._listed = None
+                stats[u"fetched"] += 1
+                stats[u"bytes"] += n
+                if act == u"update":
                     stats[u"replaced"] += 1
-                    j[u"total"] += 1
-                try:
-                    tag, n = self.fetch_image(url, fname)
-                except Exception:
-                    e = sys.exc_info()[1]
-                    stats[u"failed"] += 1
-                    j[u"failed"] += 1
-                    self.log(u"could not fetch %s: %s" % (fname, tos(str(e))))
-                    continue
-                self.lock.acquire()
-                try:
-                    im = LocalImage(fname, url)
-                    im.bytes = n
-                    im.tag = tag
-                    try:
-                        im.mtime = int(os.stat(self.image_path(fname)).st_mtime)
-                    except OSError:
-                        im.mtime = 0
-                    self.images[fname] = im
-                    self.have.add(fname)
-                    self._listed = None
-                    stats[u"fetched"] += 1
-                    stats[u"bytes"] += n
-                    j[u"done"] += 1
-                    save_now = True       # a file with no row would pass for the user's own
-                finally:
-                    self.lock.release()
-                if save_now:
-                    self.save_record()
+                j[u"done"] += 1
+            finally:
+                self.lock.release()
+            self.save_record()            # a file with no row would pass for the user's own
 
-        threads = [daemon_thread(worker) for _ in range(LOCAL_WORKERS)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            while thread_alive(t):
-                t.join(0.5)
-        if not self.cancel and not stats[u"failed"]:
+        def pool(items, final):
+            queue = list(items)
+
+            def worker():
+                while not self.cancel:
+                    qlock.acquire()
+                    try:
+                        if not queue:
+                            return
+                        item = queue.pop(0)
+                    finally:
+                        qlock.release()
+                    self.touch_folder()
+                    one(item, final)
+
+            threads = [daemon_thread(worker) for _ in range(min(LOCAL_WORKERS, len(queue)))]
+            for t in threads:
+                t.start()
+            for t in threads:
+                while thread_alive(t):
+                    t.join(0.5)
+
+        pool(todo, False)
+
+        # the hosts set aside get one more try, now that the rest is here
+        hosts = []
+        for item in later:
+            if url_host_of(item[1]) not in hosts:
+                hosts.append(url_host_of(item[1]))
+        for host in hosts:
+            if self.cancel:
+                break
+            items = [item for item in later if url_host_of(item[1]) == host]
+            since = self.host_aside.get(host)
+            if since is not None:
+                j[u"note"] = u"trying %s again" % host
+                while not self.cancel and time.time() - since < LOCAL_HOST_REST:
+                    time.sleep(0.25)
+                    self.touch_folder()
+                if self.cancel:
+                    break
+                one(items.pop(0), True, True)
+                j[u"note"] = u""
+                if self.is_aside(host):
+                    stats[u"left"] += len(items)
+                    down[host] = down.get(host, 0) + len(items)
+                    continue
+            pool(items, True)
+        j[u"note"] = u""
+        for host in sorted(down.keys()):
+            self.log(u"%s is still not answering: %d image%s left for the next Sync" % (
+                host, down[host], down[host] != 1 and u"s" or u""))
+
+        # a job that ran to its end is a sync, whatever it could not fetch:
+        # the hourly retry (auto_sync) is what picks those up
+        if not self.cancel:
             self.synced = int(time.time())
+        self.short = not self.cancel and (stats[u"failed"] + stats[u"left"]) > 0
+        rest = 0
+        if self.cancel:
+            rest = max(0, j[u"total"] - stats[u"fetched"] - stats[u"failed"] - stats[u"left"])
         self.save_record()
         line = u"%s %s: %d image(s) fetched (%s)" % (
             LOCAL_NAME, self.cancel and (what + u" stopped") or what, stats[u"fetched"],
@@ -2165,6 +2340,11 @@ class LocalCatalog(object):
                 stats[u"newer"], stats[u"newer"] == 1 and u"y" or u"ies")
         if stats[u"failed"]:
             line += u", %d failed (Sync tries them again)" % stats[u"failed"]
+        if stats[u"left"]:
+            line += u", %d left for the next Sync (%s not answering)" % (
+                stats[u"left"], u", ".join(sorted(down.keys())))
+        if rest:
+            line += u", %d not fetched yet (Sync fetches the rest)" % rest
         self.mark_written()               # images the user put in the folder meanwhile
         t, i, b, y, n = self.counts()
         self.log(line)
@@ -3879,7 +4059,7 @@ def plain_local(lib, arg):
         return u"  started; m shows progress, g the log"
     if sub == u"stop":
         loc.stop()
-        return u"  stopping after the image in flight"
+        return u"  stopping; images in flight are fetched by the next sync"
     if sub == u"reset":
         if not rest:
             return u"  m reset <file>   or   m reset yours"
@@ -4152,11 +4332,22 @@ def main(argv):
             signal.signal(sig, on_signal)
         except (ValueError, OSError, AttributeError):
             pass
+    # SIGUSR1 is the S key's Stop for a running job (tools/local_test.sh
+    # presses it; a headless share has no keys). Not on Windows.
+    usr1 = getattr(signal, "SIGUSR1", None)
+    if usr1 is not None:
+        try:
+            signal.signal(usr1, lambda signum, frame: lib.local.stop())
+        except (ValueError, OSError, AttributeError):
+            pass
     try:
         if HEADLESS:
             write(plain_status(lib))
             while True:
-                time.sleep(3600)
+                try:
+                    time.sleep(3600)
+                except IOError:           # 2.x: a signal cuts the sleep short
+                    pass
         elif opts.plain or curses is None or not sys.stdout.isatty():
             run_plain(lib)
         else:

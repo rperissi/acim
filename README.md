@@ -14,7 +14,7 @@ a2cogs.com. The card cannot tell them apart, and the contract test in
 
 ```
 +--------------------------------------------------------------------------------------------------+
-| ] CoGS IMAGE MANAGER  text edition v0.3                                     Tue Nov 10  16:46:59 |
+| ] CoGS IMAGE MANAGER  text edition v0.4                                     Tue Nov 10  16:46:59 |
 +- DISKS .po .hdv .2mg   AUDIO .mp3 .m4a .wav .aif .flac .ogg .pcm   PICTURES .jpg .png .gif .shr -+
 | Image Source URL: http://192.168.4.42:8271/  <- use for image source                             |
 | Library: /Users/rob/Apple II Disks                                                               |
@@ -135,6 +135,17 @@ this computer, then C or T.
   catalog dropped. A dropped title whose disk image is yours stays
   listed until you reset it. If over a quarter of the copy would be
   removed, nothing is.
+- A host that does not answer no longer holds the download (0.4).
+  a2cogs's own images are fetched first and the outside hosts after
+  them. A try gives up after 30 s with no bytes. Two tries in a row with
+  no reply set that host aside and the log says so, the rest of the
+  catalog comes down, and the host gets one more try at the end. If it
+  is still down the log says how many images it kept, and the hourly
+  sync fetches them once it is back.
+- Stopping a download is not a failure (0.4). Images in flight are
+  dropped without a `could not fetch` line, and the last line says how
+  many are not fetched yet. `S` fetches the rest. A try that is waiting
+  on a host ends when its 30 s are up, so Stop can take that long.
 - A `.po`, `.hdv` or `.2mg` you put in the copy's `disks` folder is
   listed as **Added (Local)** (`+`), served and writable, and left alone
   by sync, reset and remove.
